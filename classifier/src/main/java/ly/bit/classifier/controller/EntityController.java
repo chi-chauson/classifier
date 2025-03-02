@@ -38,6 +38,6 @@ public class EntityController {
                     })
                     .toList();
         }
-        return cacheService.getCacheOrFallbackToDbInBatches(keys);
+        return cacheService.getCacheOrFallbackToDbBatched(keys);
     }
 }

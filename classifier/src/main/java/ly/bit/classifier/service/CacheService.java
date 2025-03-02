@@ -14,11 +14,22 @@ import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 @Service
 public class CacheService {
+
+    // Helper class to hold batch results
+    private static class BatchResult {
+        final List<EntityClass> batch;
+        final java.util.Map<String, Object> cachedMap;
+        BatchResult(List<EntityClass> batch, java.util.Map<String, Object> cachedMap) {
+            this.batch = batch;
+            this.cachedMap = cachedMap;
+        }
+    }
 
     private final RedissonReactiveClient redissonReactiveClient;
     private final EntityRepository entityRepository;
@@ -30,6 +41,59 @@ public class CacheService {
         this.redissonReactiveClient = redissonReactiveClient;
         this.entityRepository = entityRepository;
     }
+
+    public Flux<EntityClass> getCacheOrFallbackToDbBatched(List<EntityClass> keys) {
+        // Split keys into batches of 20
+        return Flux.fromIterable(keys)
+                .buffer(20)
+                .flatMap(batch ->
+                        // For each batch, query Redis for the composite keys of the entities in that batch
+                        redissonReactiveClient.getBuckets()
+                                .get(batch.stream().map(this::compositeKey).toArray(String[]::new))
+                                .subscribeOn(Schedulers.parallel())  // Process each batch in parallel
+                                .onErrorResume(e -> {
+                                    System.err.println("Redis batch failed: " + e.getMessage());
+                                    return Mono.empty(); // In case of error, return empty result for that batch
+                                })
+                                // Wrap the batch and its Redis result in a helper object
+                                .map(map -> new BatchResult(batch, map))
+                )
+                .collectList()
+                .flatMapMany(batchResults -> {
+                    // Merge the cached results from all batches into one map.
+                    Map<String, EntityClass> allCached = batchResults.stream()
+                            .flatMap(br -> br.cachedMap.entrySet().stream()
+                                    .filter(entry -> !isTombstone((EntityClass) entry.getValue()))
+                                    .collect(Collectors.toMap(Map.Entry::getKey, entry -> (EntityClass) entry.getValue()))
+                                    .entrySet().stream())
+                            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+                    // Now determine the union of missing keys:
+                    List<EntityClass> missing = batchResults.stream()
+                            .flatMap(br -> br.batch.stream()
+                                    .filter(entity -> !allCached.containsKey(compositeKey(entity))))
+                            .distinct()  // Using equals on the composite key via our helper method
+                            .collect(Collectors.toList());
+
+                    Flux<EntityClass> dbFlux = missing.isEmpty()
+                            ? Flux.empty()
+                            : getFromDatabaseFallback(missing)
+                            .doOnNext(entity -> asyncCacheSet(compositeKey(entity), entity, Duration.ofMinutes(10)));
+
+                    // Merge the cached values and the database results and ensure uniqueness by composite key.
+                    return Flux.concat(
+                                    Flux.fromIterable(allCached.values()),
+                                    dbFlux
+                            )
+                            .distinct(this::compositeKey);
+                })
+                .switchIfEmpty(getFromDatabaseFallback(keys))
+                .onErrorResume(e -> {
+                    System.err.println("Final Redis failure, falling back to database: " + e.getMessage());
+                    return getFromDatabaseFallback(keys);
+                });
+    }
+
 
     // New method to process keys in batches of 20 concurrently
     public Flux<EntityClass> getCacheOrFallbackToDbInBatches(List<EntityClass> keys) {
