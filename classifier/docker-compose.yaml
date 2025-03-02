@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: demo_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
