@@ -22,13 +22,7 @@ import java.util.stream.Collectors;
 public class CacheService {
 
     // Helper class to hold batch results
-    private static class BatchResult {
-        final List<EntityClass> batch;
-        final java.util.Map<String, Object> cachedMap;
-        BatchResult(List<EntityClass> batch, java.util.Map<String, Object> cachedMap) {
-            this.batch = batch;
-            this.cachedMap = cachedMap;
-        }
+    private record BatchResult(List<EntityClass> batch, Map<String, Object> cachedMap) {
     }
 
     private final RedissonReactiveClient redissonReactiveClient;
@@ -43,14 +37,14 @@ public class CacheService {
     }
 
     public Flux<EntityClass> getCacheOrFallbackToDbBatched(List<EntityClass> keys) {
-        // Split keys into batches of 20
+        // Split keys into batches of 20 and process them in parallel.
         return Flux.fromIterable(keys)
                 .buffer(20)
                 .flatMap(batch ->
                         // For each batch, query Redis for the composite keys of the entities in that batch
                         redissonReactiveClient.getBuckets()
                                 .get(batch.stream().map(this::compositeKey).toArray(String[]::new))
-                                .subscribeOn(Schedulers.parallel())  // Process each batch in parallel
+                                .subscribeOn(Schedulers.parallel()) // Process each batch in parallel
                                 .onErrorResume(e -> {
                                     System.err.println("Redis batch failed: " + e.getMessage());
                                     return Mono.empty(); // In case of error, return empty result for that batch
@@ -68,29 +62,47 @@ public class CacheService {
                                     .entrySet().stream())
                             .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 
-                    // Now determine the union of missing keys:
-                    List<EntityClass> missing = batchResults.stream()
-                            .flatMap(br -> br.batch.stream()
-                                    .filter(entity -> !allCached.containsKey(compositeKey(entity))))
-                            .distinct()  // Using equals on the composite key via our helper method
-                            .collect(Collectors.toList());
+                    // Determine missing keys: those not present in the cache.
+                    List<EntityClass> missingKeys = keys.stream()
+                            .filter(entity -> !allCached.containsKey(compositeKey(entity)))
+                            .toList();
 
-                    Flux<EntityClass> dbFlux = missing.isEmpty()
-                            ? Flux.empty()
-                            : getFromDatabaseFallback(missing)
-                            .doOnNext(entity -> asyncCacheSet(compositeKey(entity), entity, Duration.ofMinutes(10)));
+                    if (missingKeys.isEmpty()) {
+                        return Flux.fromIterable(allCached.values());
+                    }
 
-                    // Merge the cached values and the database results and ensure uniqueness by composite key.
-                    return Flux.concat(
-                                    Flux.fromIterable(allCached.values()),
-                                    dbFlux
-                            )
-                            .distinct(this::compositeKey);
+                    // Query the DB for the union of missing keys.
+                    return getFromDatabase(missingKeys)
+                            .collectList()
+                            .flatMapMany(dbResults -> {
+                                // Compute the composite keys retrieved from the DB.
+                                Set<String> retrievedKeys = dbResults.stream()
+                                        .map(this::compositeKey)
+                                        .collect(Collectors.toSet());
+
+                                // Determine keys still missing from DB.
+                                List<EntityClass> stillMissingKeys = missingKeys.stream()
+                                        .filter(entity -> !retrievedKeys.contains(compositeKey(entity)))
+                                        .toList();
+
+                                // Fire-and-forget: set tombstones for keys not found in DB.
+                                Flux.fromIterable(stillMissingKeys)
+                                        .doOnNext(missingKey -> asyncCacheSet(compositeKey(missingKey), TOMBSTONE, Duration.ofMinutes(10)))
+                                        .subscribe();
+
+                                // Fire-and-forget: cache DB results asynchronously.
+                                Flux<EntityClass> cachedDbResults = Flux.fromIterable(dbResults)
+                                        .doOnNext(entity -> asyncCacheSet(compositeKey(entity), entity, Duration.ofMinutes(10)));
+
+                                // Merge DB results with cached results, ensuring uniqueness.
+                                return cachedDbResults.concatWith(Flux.fromIterable(allCached.values()))
+                                        .distinct(this::compositeKey);
+                            });
                 })
-                .switchIfEmpty(getFromDatabaseFallback(keys))
+                .switchIfEmpty(getFromDatabase(keys))
                 .onErrorResume(e -> {
                     System.err.println("Final Redis failure, falling back to database: " + e.getMessage());
-                    return getFromDatabaseFallback(keys);
+                    return getFromDatabase(keys);
                 });
     }
 
@@ -171,15 +183,15 @@ public class CacheService {
                                         .distinct(entity -> compositeKey(entity));
                             });
                 })
-                .switchIfEmpty(getFromDatabaseFallback(keys))
+                .switchIfEmpty(getFromDatabase(keys))
                 .onErrorResume(ex -> {
                     System.err.println("Final Redis failure, falling back to database: " + ex.getMessage());
-                    return getFromDatabaseFallback(keys);
+                    return getFromDatabase(keys);
                 });
     }
 
     // Helper method: fallback to fetching all entities from the database (via repository)
-    private Flux<EntityClass> getFromDatabaseFallback(List<EntityClass> keys) {
+    private Flux<EntityClass> getFromDatabase(List<EntityClass> keys) {
         return Flux.fromIterable(keys)
                 .flatMap(key -> entityRepository.findByEntityIdAndIdTypeAndScheme(key.entityId(), key.idType(), key.scheme()));
     }
