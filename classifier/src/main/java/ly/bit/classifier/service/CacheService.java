@@ -13,6 +13,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -52,19 +53,19 @@ public class CacheService {
                                 // Wrap the batch and its Redis result in a helper object
                                 .map(map -> new BatchResult(batch, map))
                 )
-                .collectList()
-                .flatMapMany(batchResults -> {
-                    // Merge the cached results from all batches into one map.
-                    Map<String, EntityClass> allCached = batchResults.stream()
-                            .flatMap(br -> br.cachedMap.entrySet().stream()
-                                    .filter(entry -> !isTombstone((EntityClass) entry.getValue()))
-                                    .collect(Collectors.toMap(Map.Entry::getKey, entry -> (EntityClass) entry.getValue()))
-                                    .entrySet().stream())
-                            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+                // Instead of collecting a List<BatchResult>, aggregate all cached maps into one map.
+                .collect(() -> new HashMap<String, Object>(), (aggMap, br) -> {
+                    aggMap.putAll(br.cachedMap);
+                })
+                .flatMapMany(aggregatedMap -> {
+                    // Now, aggregatedMap is a Mono<Map<String, Object>> containing all cached results.
+                    Map<String, EntityClass> allCached = aggregatedMap.entrySet().stream()
+                            .filter(entry -> !isTombstone((EntityClass) entry.getValue()))
+                            .collect(Collectors.toMap(Map.Entry::getKey, entry -> (EntityClass) entry.getValue()));
 
-                    // Determine missing keys: those not present in the cache.
+                    // Determine missing keys from the original keys based on composite key.
                     List<EntityClass> missingKeys = keys.stream()
-                            .filter(entity -> !allCached.containsKey(compositeKey(entity)))
+                            .filter(entity -> !aggregatedMap.containsKey(compositeKey(entity)))
                             .toList();
 
                     if (missingKeys.isEmpty()) {
