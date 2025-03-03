@@ -22,10 +22,6 @@ import java.util.stream.Collectors;
 @Service
 public class CacheService {
 
-    // Helper class to hold batch results
-    private record BatchResult(List<EntityClass> batch, Map<String, Object> cachedMap) {
-    }
-
     private final RedissonReactiveClient redissonReactiveClient;
     private final EntityRepository entityRepository;
 
@@ -50,13 +46,9 @@ public class CacheService {
                                     System.err.println("Redis batch failed: " + e.getMessage());
                                     return Mono.empty(); // In case of error, return empty result for that batch
                                 })
-                                // Wrap the batch and its Redis result in a helper object
-                                .map(map -> new BatchResult(batch, map))
                 )
                 // Instead of collecting a List<BatchResult>, aggregate all cached maps into one map.
-                .collect(() -> new HashMap<String, Object>(), (aggMap, br) -> {
-                    aggMap.putAll(br.cachedMap);
-                })
+                .collect(() -> new HashMap<String, Object>(), (aggMap, map) -> aggMap.putAll(map))
                 .flatMapMany(aggregatedMap -> {
                     // Now, aggregatedMap is a Mono<Map<String, Object>> containing all cached results.
                     Map<String, EntityClass> allCached = aggregatedMap.entrySet().stream()
