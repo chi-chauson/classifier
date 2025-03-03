@@ -7,6 +7,8 @@ import org.redisson.client.RedisTimeoutException;
 import org.redisson.client.RedisConnectionException;
 import org.redisson.client.RedisBusyException;
 import org.redisson.client.RedisMovedException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -21,6 +23,7 @@ import java.util.stream.Collectors;
 
 @Service
 public class CacheService {
+    private static final Logger log = LoggerFactory.getLogger(CacheService.class);
 
     private final RedissonReactiveClient redissonReactiveClient;
     private final EntityRepository entityRepository;
@@ -37,16 +40,22 @@ public class CacheService {
         // Split keys into batches of 20 and process them in parallel.
         return Flux.fromIterable(keys)
                 .buffer(20)
-                .flatMap(batch ->
-                        // For each batch, query Redis for the composite keys of the entities in that batch
-                        redissonReactiveClient.getBuckets()
-                                .get(batch.stream().map(this::compositeKey).toArray(String[]::new))
-                                .subscribeOn(Schedulers.parallel()) // Process each batch in parallel
-                                .onErrorResume(e -> {
-                                    System.err.println("Redis batch failed: " + e.getMessage());
-                                    return Mono.empty(); // In case of error, return empty result for that batch
-                                })
-                )
+                .flatMap(batch -> {
+                    List<String> batchKeys = batch.stream()
+                            .map(this::compositeKey)
+                            .toList();
+                    log.info("Processing batch of size: {}", batch.size());
+                    // For each batch, query Redis for the composite keys of the entities in that batch
+                    return redissonReactiveClient.getBuckets()
+                            .get(batchKeys.toArray(String[]::new))
+                            .subscribeOn(Schedulers.parallel()) // Process each batch in parallel
+                            .doOnNext(map -> log.info("Batch completed for keys: {}", batchKeys))
+                            .onErrorResume(e -> {
+                                System.err.println("Redis batch failed: " + e.getMessage());
+                                return Mono.empty(); // In case of error, return empty result for that batch
+                            });
+
+                })
                 // Instead of collecting a List<BatchResult>, aggregate all cached maps into one map.
                 .collect(() -> new HashMap<String, Object>(), (aggMap, map) -> aggMap.putAll(map))
                 .flatMapMany(aggregatedMap -> {
