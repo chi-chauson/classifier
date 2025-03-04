@@ -3,12 +3,10 @@ package ly.bit.classifier.service;
 import ly.bit.classifier.domain.EntityClass;
 import ly.bit.classifier.repository.EntityRepository;
 import org.redisson.api.RedissonReactiveClient;
-import org.redisson.client.RedisTimeoutException;
-import org.redisson.client.RedisConnectionException;
 import org.redisson.client.RedisBusyException;
+import org.redisson.client.RedisConnectionException;
 import org.redisson.client.RedisMovedException;
-import org.redisson.client.codec.Codec;
-import org.redisson.codec.JsonJacksonCodec;
+import org.redisson.client.RedisTimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -17,7 +15,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
-import java.util.HashMap;
+import java.util.AbstractMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,10 +26,12 @@ import java.util.stream.Collectors;
 public class CacheService {
     private static final Logger log = LoggerFactory.getLogger(CacheService.class);
 
+    // RedissonReactiveClient for Redis operations.
     private final RedissonReactiveClient redissonReactiveClient;
+    // Repository for database queries via Spring Data R2DBC.
     private final EntityRepository entityRepository;
 
-    // Tombstone marker to denote non-existent entries.
+    // A special marker (tombstone) to represent a key that is known not to exist in the DB.
     private final EntityClass TOMBSTONE = new EntityClass("TOMBSTONE", "TOMBSTONE", "TOMBSTONE", "TOMBSTONE");
 
     public CacheService(RedissonReactiveClient redissonReactiveClient, EntityRepository entityRepository) {
@@ -49,35 +49,33 @@ public class CacheService {
      * @param codec     Codec to use for deserialization.
      * @param <T>       The type of the input key.
      * @param <V>       The type of the value stored in Redis.
-     * @return A Mono emitting an aggregated Map from composite keys to V.
+     * @return Flux emitting individual key/value pairs as AbstractMap.SimpleEntry<String, V>.
      */
-    public <T, V> Mono<Map<String, V>> fetchBatchedBucketsGeneric(
+    public <T, V> Flux<AbstractMap.SimpleEntry<String, V>> fetchBatchedBucketsGeneric(
             List<T> keys,
             Function<T, String> keyMapper,
             Class<V> clazz) {
 
-        List<String> compositeKeys = keys.stream()
-                .map(keyMapper)
-                .collect(Collectors.toList());
-
         return Flux.fromIterable(keys)
                 .buffer(20)
+                // For each batch, compute its composite keys.
                 .flatMap(batch -> {
                     List<String> batchKeys = batch.stream()
                             .map(keyMapper)
                             .collect(Collectors.toList());
                     log.info("Processing batch of size {} with keys: {}", batch.size(), batchKeys);
+                    // Query Redis for the current batch.
                     return redissonReactiveClient.getBuckets()
                             .get(batchKeys.toArray(new String[0]))
-                            .subscribeOn(Schedulers.parallel())
                             .onErrorResume(e -> {
                                 log.error("Redis batch failed: {}", e.getMessage());
                                 return Mono.empty();
                             });
                 })
-                .collect(() -> new HashMap<String, V>(), (aggMap, batchMap) -> {
-                    batchMap.forEach((k, v) -> aggMap.put(k, clazz.cast(v)));
-                });
+                // Flatten each batch's returned map (Map<String, Object>) into a Flux of its entries.
+                .flatMap(map -> Flux.fromIterable(map.entrySet()))
+                // Cast each entry's value to the desired type V and wrap it in a SimpleEntry.
+                .map(entry -> new AbstractMap.SimpleEntry<>(entry.getKey(), clazz.cast(entry.getValue())));
     }
 
 
@@ -93,6 +91,8 @@ public class CacheService {
         return fetchBatchedBucketsGeneric(keys,
                 this::compositeKey,
                 EntityClass.class)
+                .subscribeOn(Schedulers.parallel())
+                .collectMap(entry -> entry.getKey(), entry -> entry.getValue())
                 .doOnNext(aggregatedMap -> log.info("Aggregated Redis map has {} entries", aggregatedMap.size()))
                 .flatMapMany(aggregatedMap -> {
                     // Build a map of cached (non-tombstone) results.
