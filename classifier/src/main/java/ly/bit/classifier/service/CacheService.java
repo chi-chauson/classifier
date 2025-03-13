@@ -136,23 +136,39 @@ public class CacheService {
                                 log.info("Keys still missing after DB query: {}",
                                         stillMissingKeys.stream().map(this::compositeKey).collect(Collectors.toList()));
 
-                                // For each key still missing, set a tombstone asynchronously (fire-and-forget).
-                                Flux.fromIterable(stillMissingKeys)
-                                        .doOnNext(missingKey -> {
-                                            log.info("Setting tombstone for missing key: {}", compositeKey(missingKey));
-                                            asyncCacheSet(compositeKey(missingKey), TOMBSTONE, Duration.ofMinutes(10));
-                                        })
-                                        .subscribe();
+                                // For keys still missing, set tombstones in batch
+                                if (!stillMissingKeys.isEmpty()) {
+                                    Map<String, EntityClass> tombstonesMap = stillMissingKeys.stream()
+                                            .collect(Collectors.toMap(
+                                                    this::compositeKey,
+                                                    missingKey -> TOMBSTONE
+                                            ));
+                                    int batchSize = 20;
+                                    log.info("Setting tombstones for missing keys: {}, batch size: {}", tombstonesMap.keySet(), batchSize);
+                                    asyncCacheBatchSet(tombstonesMap, Duration.ofMinutes(10), batchSize)
+                                            .doFinally(signalType -> log.info("Tombstone batch caching completed with signal: {}", signalType))
+                                            .subscribeOn(Schedulers.boundedElastic())
+                                            .subscribe();
+                                }
 
-                                // Cache the DB results asynchronously.
-                                Flux<EntityClass> cachedDbResults = Flux.fromIterable(dbResults)
-                                        .doOnNext(entity -> {
-                                            log.info("Caching DB result: {}", compositeKey(entity));
-                                            asyncCacheSet(compositeKey(entity), entity, Duration.ofMinutes(10));
-                                        });
+                                // Cache the DB results in batch
+                                if (!dbResults.isEmpty()) {
+                                    Map<String, EntityClass> dbResultsMap = dbResults.stream()
+                                            .collect(Collectors.toMap(
+                                                    this::compositeKey,
+                                                    entity -> entity
+                                            ));
+                                    int batchSize = 20;
+                                    log.info("Caching DB results: {}, batch size: {}", dbResultsMap.keySet(), batchSize);
+                                    asyncCacheBatchSet(dbResultsMap, Duration.ofMinutes(10), batchSize)
+                                            .doFinally(signalType -> log.info("DB results batch caching completed with signal: {}", signalType))
+                                            .subscribeOn(Schedulers.boundedElastic())
+                                            .subscribe();
+                                }
 
                                 // Merge the DB results with cached results and ensure uniqueness.
-                                return cachedDbResults.concatWith(Flux.fromIterable(allCached.values()))
+                                return Flux.fromIterable(dbResults)
+                                        .concatWith(Flux.fromIterable(allCached.values()))
                                         .distinct(this::compositeKey);
                             });
                 })
@@ -199,7 +215,7 @@ public class CacheService {
         List<Map.Entry<String, V>> entries = new ArrayList<>(keysToValues.entrySet());
 
         for (int i = 0; i < entries.size(); i += batchSize) {
-            batches.add(entries.subList(i, Math.max(i + batchSize, entries.size())));
+            batches.add(entries.subList(i, Math.min(i + batchSize, entries.size())));
         }
 
         return Flux.fromIterable(batches)
@@ -207,8 +223,7 @@ public class CacheService {
                     RBatchReactive redisBatch = redissonReactiveClient.createBatch();
 
                     for (Map.Entry<String, V> entry : batchEntries) {
-                        redisBatch.getBucket(entry.getKey())
-                                .set(entry.getValue(), ttl.toMillis(), TimeUnit.MICROSECONDS);
+                        redisBatch.getBucket(entry.getKey()).set(entry.getValue(), ttl);
                     }
 
                     return redisBatch.execute()
