@@ -3,7 +3,11 @@ package ly.bit.classifier.service;
 import ly.bit.classifier.domain.CacheTuple;
 import ly.bit.classifier.domain.EntityClass;
 import ly.bit.classifier.repository.EntityRepository;
+import org.redisson.api.BatchResult;
+import org.redisson.api.RBatch;
 import org.redisson.api.RBatchReactive;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.redisson.api.RedissonReactiveClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -26,14 +31,19 @@ public class CacheService {
 
     // RedissonReactiveClient for Redis operations.
     private final RedissonReactiveClient redissonReactiveClient;
+
+    // RedissonClient for locking operations.
+    private final RedissonClient redissonClient;
+
     // Repository for database queries via Spring Data R2DBC.
     private final EntityRepository entityRepository;
 
     // A special marker (tombstone) to represent a key that is known not to exist in the DB.
     private final EntityClass TOMBSTONE = new EntityClass("TOMBSTONE", "TOMBSTONE", "TOMBSTONE", "TOMBSTONE");
 
-    public CacheService(RedissonReactiveClient redissonReactiveClient, EntityRepository entityRepository) {
+    public CacheService(RedissonReactiveClient redissonReactiveClient, RedissonClient redissonClient, EntityRepository entityRepository) {
         this.redissonReactiveClient = redissonReactiveClient;
+        this.redissonClient = redissonClient;
         this.entityRepository = entityRepository;
     }
 
@@ -107,11 +117,16 @@ public class CacheService {
             batches.add(entries.subList(i, Math.min(i + batchSize, entries.size())));
         }
 
+        log.info("Created {} batches for {} total entries with batch size {}",
+                batches.size(), entries.size(), batchSize);
+
         return Flux.fromIterable(batches)
                 .flatMap(batchEntries -> {
                     RBatchReactive redisBatch = redissonReactiveClient.createBatch();
 
                     for (Map.Entry<String, V> entry : batchEntries) {
+                        // The returned publisher is intentionally not used individually
+                        // as we handle the entire batch with redisBatch.execute() later
                         redisBatch.getBucket(entry.getKey()).set(entry.getValue(), ttl);
                     }
 
@@ -123,6 +138,106 @@ public class CacheService {
                             });
 
                 }).then();
+    }
+
+    /**
+     * Sets multiple key-value pairs in Redis using batched operations with distributed locking.
+     * This approach contains all lock operations in a single thread to maintain thread affinity.
+     *
+     * @param keysToValues Map containing the key-value pairs to store in Redis.
+     * @param ttl          The time-to-live duration for the cached entries.
+     * @param batchSize    The maximum number of operations to include in each Redis batch.
+     * @param <V>          The type of values to be stored.
+     * @return A Mono<Void> that completes when all batch operations are finished.
+     */
+    private <V> Mono<Void> setManyKeysWithLocks(Map<String, V> keysToValues, Duration ttl, int batchSize) {
+        if (keysToValues == null || keysToValues.isEmpty()) {
+            return Mono.empty();
+        }
+
+        // This wraps the entire blocking operation in a single callable that executes on one thread
+        return Mono.fromCallable(() -> {
+                    // Create lock objects for each Redis key
+                    RLock[] locks = keysToValues.keySet().stream()
+                            .map(key -> redissonClient.getLock("lock:" + key))
+                            .toArray(RLock[]::new);
+
+                    // Create a multilock
+                    RLock multiLock = redissonClient.getMultiLock(locks);
+
+                    try {
+                        // Attempt to acquire the lock (blocking)
+                        log.info("Attempting to acquire multilock for {} keys on thread {}",
+                                locks.length, Thread.currentThread().getName());
+
+                        boolean acquired = multiLock.tryLock(5, 30, TimeUnit.SECONDS);
+                        if (!acquired) {
+                            throw new RuntimeException("Failed to acquire locks for Redis keys");
+                        }
+
+                        log.info("Successfully acquired multilock on thread {}", Thread.currentThread().getName());
+
+                        try {
+                            // Execute Redis operations synchronously
+                            executeRedisOperationsBlocking(keysToValues, ttl, batchSize);
+                            log.info("Successfully executed Redis operations");
+                            // Return true to signal completion (will be converted to Void)
+                            return true;
+                        } finally {
+                            // Always release the lock in the same thread
+                            try {
+                                multiLock.unlock();
+                                log.info("Released multilock on thread {}", Thread.currentThread().getName());
+                            } catch (Exception e) {
+                                log.error("Failed to release multilock", e);
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Lock acquisition was interrupted", e);
+                    }
+                })
+                // Schedule the entire operation on a boundedElastic thread
+                .subscribeOn(Schedulers.boundedElastic())
+                // Convert any exceptions to Mono.error
+                .onErrorMap(e -> new RuntimeException("Failed in lock operation: " + e.getMessage(), e))
+                // Convert the Mono<Boolean> to Mono<Void>
+                .then();
+    }
+
+    /**
+     * Blocking method to execute Redis operations synchronously.
+     * This keeps all Redis operations within the same thread that holds the lock.
+     */
+    private <V> void executeRedisOperationsBlocking(Map<String, V> keysToValues, Duration ttl, int batchSize) {
+        List<List<Map.Entry<String, V>>> batches = new ArrayList<>();
+        List<Map.Entry<String, V>> entries = new ArrayList<>(keysToValues.entrySet());
+
+        for (int i = 0; i < entries.size(); i += batchSize) {
+            batches.add(entries.subList(i, Math.min(i + batchSize, entries.size())));
+        }
+
+        log.info("Processing {} batches with size {}", batches.size(), batchSize);
+
+        for (List<Map.Entry<String, V>> batch : batches) {
+            try {
+                // Create a synchronous batch
+                RBatch syncBatch = redissonClient.createBatch();
+
+                for (Map.Entry<String, V> entry : batch) {
+                    syncBatch.getBucket(entry.getKey()).setAsync(entry.getValue(), ttl);
+                }
+
+                // Execute synchronously - this blocks until complete
+                BatchResult<?> result = syncBatch.execute();
+                log.info("Executed Redis batch of size {} with {} responses",
+                        batch.size(), result.getResponses().size());
+
+            } catch (Exception e) {
+                log.error("Error executing Redis batch", e);
+                throw new RuntimeException("Failed to execute Redis operations", e);
+            }
+        }
     }
 
 
@@ -186,7 +301,7 @@ public class CacheService {
                                             ));
                                     int batchSize = 20;
                                     log.info("Setting tombstones for missing keys: {}, batch size: {}", tombstonesMap.keySet(), batchSize);
-                                    setManyKeys(tombstonesMap, Duration.ofMinutes(10), batchSize)
+                                    setManyKeysWithLocks(tombstonesMap, Duration.ofMinutes(10), batchSize)
                                             .doFinally(signalType -> log.info("Tombstone batch caching completed with signal: {}", signalType))
                                             .subscribeOn(Schedulers.boundedElastic())
                                             .subscribe();
@@ -201,7 +316,7 @@ public class CacheService {
                                             ));
                                     int batchSize = 20;
                                     log.info("Caching DB results: {}, batch size: {}", dbResultsMap.keySet(), batchSize);
-                                    setManyKeys(dbResultsMap, Duration.ofMinutes(10), batchSize)
+                                    setManyKeysWithLocks(dbResultsMap, Duration.ofMinutes(10), batchSize)
                                             .doFinally(signalType -> log.info("DB results batch caching completed with signal: {}", signalType))
                                             .subscribeOn(Schedulers.boundedElastic())
                                             .subscribe();
