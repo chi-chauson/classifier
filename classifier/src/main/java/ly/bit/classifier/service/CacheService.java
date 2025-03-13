@@ -5,10 +5,6 @@ import ly.bit.classifier.domain.EntityClass;
 import ly.bit.classifier.repository.EntityRepository;
 import org.redisson.api.RBatchReactive;
 import org.redisson.api.RedissonReactiveClient;
-import org.redisson.client.RedisBusyException;
-import org.redisson.client.RedisConnectionException;
-import org.redisson.client.RedisMovedException;
-import org.redisson.client.RedisTimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -21,7 +17,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -42,21 +37,20 @@ public class CacheService {
         this.entityRepository = entityRepository;
     }
 
-    private class ErrorMarker {
+    private static class ErrorMarker {
         // This class is used as a marker to indicate an error
     }
 
     /**
      * Generic helper method that batches a list of keys (of type T) into batches of 20,
-     * queries Redis using the provided keyMapper and codec, and aggregates the results
-     * into a Map<String, V>.
+     * queries Redis using the provided keyMapper, and returns the results as a Flux of CacheTuple.
      *
-     * @param keys      List of keys of type T.
-     * @param keyMapper Function that maps a T to a String composite key.
-     * @param <V>       The type of the value stored in Redis.
-     * @return Flux emitting individual key/value pairs as AbstractMap.SimpleEntry<String, V>.
+     * @param keys      List of keys of type V to retrieve from the cache.
+     * @param keyMapper Function that maps each key to a String composite key used in Redis.
+     * @param <V>       The type of both the keys and the values stored in Redis.
+     * @return Flux emitting individual key/value pairs wrapped in CacheTuple objects.
      */
-    public <V> Flux<CacheTuple<V>> fetchBatchedBucketsGeneric(
+    public <V> Flux<CacheTuple<V>> getManyKeys(
             List<V> keys,
             Function<V, String> keyMapper) {
 
@@ -83,24 +77,71 @@ public class CacheService {
                 .map(entry -> {
                     Object value = entry.getValue();
                     boolean isError = value instanceof ErrorMarker;
-                    return new CacheTuple<>(entry.getKey(), isError ? null : (V) value, isError);
+
+                    @SuppressWarnings("unchecked")
+                    V typedValue = isError ? null : (V) value;
+
+                    return new CacheTuple<>(entry.getKey(), isError ? null : typedValue, isError);
                 });
+    }
+
+    /**
+     * Sets multiple key-value pairs in Redis using batched operations for improved performance.
+     * Keys are processed in batches of the specified size to optimize Redis operations.
+     *
+     * @param keysToValues Map containing the key-value pairs to store in Redis.
+     * @param ttl          The time-to-live duration for the cached entries.
+     * @param batchSize    The maximum number of operations to include in each Redis batch.
+     * @param <V>          The type of values to be stored.
+     * @return A Mono<Void> that completes when all batch operations are finished.
+     */
+    private <V> Mono<Void> setManyKeys(Map<String, V> keysToValues, Duration ttl, int batchSize) {
+        if (keysToValues == null || keysToValues.isEmpty()) {
+            return Mono.empty();
+        }
+
+        List<List<Map.Entry<String, V>>> batches = new ArrayList<>();
+        List<Map.Entry<String, V>> entries = new ArrayList<>(keysToValues.entrySet());
+
+        for (int i = 0; i < entries.size(); i += batchSize) {
+            batches.add(entries.subList(i, Math.min(i + batchSize, entries.size())));
+        }
+
+        return Flux.fromIterable(batches)
+                .flatMap(batchEntries -> {
+                    RBatchReactive redisBatch = redissonReactiveClient.createBatch();
+
+                    for (Map.Entry<String, V> entry : batchEntries) {
+                        redisBatch.getBucket(entry.getKey()).set(entry.getValue(), ttl);
+                    }
+
+                    return redisBatch.execute()
+                            .doOnNext(result -> log.info("Executed batch of size {}", batchEntries.size()))
+                            .onErrorResume(throwable -> {
+                                log.error("Failed batch set operation in cache: ", throwable);
+                                return Mono.empty();
+                            });
+
+                }).then();
     }
 
 
     /**
-     * Main method that uses the generic batching helper to query Redis, determine missing keys,
-     * fall back to the database for missing keys, set tombstones for keys not found in DB, and merge all results.
+     * Main method that retrieves entities from cache with fallback to database.
+     * The method first attempts to retrieve all requested entities from Redis cache,
+     * then falls back to the database for any missing keys. It also maintains cache
+     * consistency by setting tombstones for keys not found in the database and caching
+     * database results for future use.
      *
      * @param keys List of EntityClass objects representing the requested entities.
-     * @return A Flux emitting unique EntityClass results.
+     * @return A Flux emitting unique EntityClass results, either from cache or database.
      */
     public Flux<EntityClass> getCacheOrFallbackToDbBatched(List<EntityClass> keys) {
         // Use the generic helper to get a typed aggregated map from Redis.
-        return fetchBatchedBucketsGeneric(keys, this::compositeKey)
+        return getManyKeys(keys, this::compositeKey)
                 .subscribeOn(Schedulers.parallel())
                 .filter(tuple -> !tuple.error())
-                .collectMap(tuple -> tuple.key(), tuple -> tuple.value())
+                .collectMap(CacheTuple::key, CacheTuple::value)
                 .doOnNext(aggregatedMap -> log.info("Aggregated Redis map has {} entries", aggregatedMap.size()))
                 .flatMapMany(aggregatedMap -> {
                     // Build a map of cached (non-tombstone) results.
@@ -132,7 +173,7 @@ public class CacheService {
                                 // Identify keys still missing in DB.
                                 List<EntityClass> stillMissingKeys = missingKeys.stream()
                                         .filter(entity -> !retrievedKeys.contains(compositeKey(entity)))
-                                        .collect(Collectors.toList());
+                                        .toList();
                                 log.info("Keys still missing after DB query: {}",
                                         stillMissingKeys.stream().map(this::compositeKey).collect(Collectors.toList()));
 
@@ -145,7 +186,7 @@ public class CacheService {
                                             ));
                                     int batchSize = 20;
                                     log.info("Setting tombstones for missing keys: {}, batch size: {}", tombstonesMap.keySet(), batchSize);
-                                    asyncCacheBatchSet(tombstonesMap, Duration.ofMinutes(10), batchSize)
+                                    setManyKeys(tombstonesMap, Duration.ofMinutes(10), batchSize)
                                             .doFinally(signalType -> log.info("Tombstone batch caching completed with signal: {}", signalType))
                                             .subscribeOn(Schedulers.boundedElastic())
                                             .subscribe();
@@ -160,7 +201,7 @@ public class CacheService {
                                             ));
                                     int batchSize = 20;
                                     log.info("Caching DB results: {}, batch size: {}", dbResultsMap.keySet(), batchSize);
-                                    asyncCacheBatchSet(dbResultsMap, Duration.ofMinutes(10), batchSize)
+                                    setManyKeys(dbResultsMap, Duration.ofMinutes(10), batchSize)
                                             .doFinally(signalType -> log.info("DB results batch caching completed with signal: {}", signalType))
                                             .subscribeOn(Schedulers.boundedElastic())
                                             .subscribe();
@@ -183,57 +224,6 @@ public class CacheService {
     private Flux<EntityClass> getFromDatabase(List<EntityClass> keys) {
         return Flux.fromIterable(keys)
                 .flatMap(key -> entityRepository.findByEntityIdAndIdTypeAndScheme(key.entityId(), key.idType(), key.scheme()));
-    }
-
-    // Reusable method to asynchronously set a value (or tombstone) in Redis (fire-and-forget)
-    private void asyncCacheSet(String compositeKey, EntityClass value, Duration ttl) {
-        redissonReactiveClient.getBucket(compositeKey)
-                .set(value, ttl)
-                .onErrorResume(ex -> {
-                    if (ex instanceof RedisTimeoutException) {
-                        System.err.println("RedisTimeoutException: " + ex.getMessage());
-                    } else if (ex instanceof RedisConnectionException) {
-                        System.err.println("RedisConnectionException: " + ex.getMessage());
-                    } else if (ex instanceof RedisBusyException) {
-                        System.err.println("RedisBusyException: " + ex.getMessage());
-                    } else if (ex instanceof RedisMovedException) {
-                        System.err.println("RedisMovedException: " + ex.getMessage());
-                    } else {
-                        System.err.println("Unknown Redis exception: " + ex.getMessage());
-                    }
-                    return Mono.empty();
-                })
-                .subscribe();
-    }
-
-    private <V> Mono<Void> asyncCacheBatchSet(Map<String, V> keysToValues, Duration ttl, int batchSize) {
-        if (keysToValues == null || keysToValues.isEmpty()) {
-            return Mono.empty();
-        }
-
-        List<List<Map.Entry<String, V>>> batches = new ArrayList<>();
-        List<Map.Entry<String, V>> entries = new ArrayList<>(keysToValues.entrySet());
-
-        for (int i = 0; i < entries.size(); i += batchSize) {
-            batches.add(entries.subList(i, Math.min(i + batchSize, entries.size())));
-        }
-
-        return Flux.fromIterable(batches)
-                .flatMap(batchEntries -> {
-                    RBatchReactive redisBatch = redissonReactiveClient.createBatch();
-
-                    for (Map.Entry<String, V> entry : batchEntries) {
-                        redisBatch.getBucket(entry.getKey()).set(entry.getValue(), ttl);
-                    }
-
-                    return redisBatch.execute()
-                            .doOnNext(result -> log.info("Executed batch of size {}", batchEntries.size()))
-                            .onErrorResume(throwable -> {
-                               log.error("Failed batch set operation in cache: ", throwable);
-                               return Mono.empty();
-                            });
-
-                }).then();
     }
 
     // Determines if the given entity is a tombstone.
